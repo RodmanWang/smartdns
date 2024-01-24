@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -299,4 +299,58 @@ address /*.b.com/#6
 	EXPECT_EQ(client.GetAnswer()[0].GetTTL(), 700);
 	EXPECT_EQ(client.GetAnswer()[0].GetType(), "AAAA");
 	EXPECT_EQ(client.GetAnswer()[0].GetData(), "64:ff9b::102:304");
+}
+
+TEST_F(Rule, root)
+{
+	smartdns::MockServer server_upstream;
+	smartdns::Server server;
+
+	server_upstream.Start("udp://0.0.0.0:61053", [&](struct smartdns::ServerRequestContext *request) {
+		if (request->qtype == DNS_T_A) {
+			smartdns::MockServer::AddIP(request, request->domain.c_str(), "1.2.3.4", 700);
+			return smartdns::SERVER_REQUEST_OK;
+		} else if (request->qtype == DNS_T_AAAA) {
+			smartdns::MockServer::AddIP(request, request->domain.c_str(), "64:ff9b::102:304", 700);
+			return smartdns::SERVER_REQUEST_OK;
+		}
+		return smartdns::SERVER_REQUEST_SOA;
+	});
+
+	server.Start(R"""(bind [::]:60053
+server 127.0.0.1:61053
+speed-check-mode none
+address #6
+address /-.a.com/-6
+address 
+)""");
+	smartdns::Client client;
+
+	ASSERT_TRUE(client.Query("a.com A", 60053));
+	std::cout << client.GetResult() << std::endl;
+	ASSERT_EQ(client.GetAnswerNum(), 1);
+	EXPECT_EQ(client.GetStatus(), "NOERROR");
+	EXPECT_EQ(client.GetAnswer()[0].GetName(), "a.com");
+	EXPECT_EQ(client.GetAnswer()[0].GetTTL(), 700);
+	EXPECT_EQ(client.GetAnswer()[0].GetType(), "A");
+	EXPECT_EQ(client.GetAnswer()[0].GetData(), "1.2.3.4");
+
+	ASSERT_TRUE(client.Query("a.com AAAA", 60053));
+	std::cout << client.GetResult() << std::endl;
+	ASSERT_EQ(client.GetAnswerNum(), 1);
+	EXPECT_EQ(client.GetStatus(), "NOERROR");
+	EXPECT_EQ(client.GetAnswer()[0].GetName(), "a.com");
+	EXPECT_EQ(client.GetAnswer()[0].GetTTL(), 700);
+	EXPECT_EQ(client.GetAnswer()[0].GetType(), "AAAA");
+	EXPECT_EQ(client.GetAnswer()[0].GetData(), "64:ff9b::102:304");
+
+	ASSERT_TRUE(client.Query("a.a.com AAAA", 60053));
+	std::cout << client.GetResult() << std::endl;
+	ASSERT_EQ(client.GetAnswerNum(), 0);
+	EXPECT_EQ(client.GetStatus(), "NOERROR");
+
+	ASSERT_TRUE(client.Query("b.com AAAA", 60053));
+	std::cout << client.GetResult() << std::endl;
+	ASSERT_EQ(client.GetAnswerNum(), 0);
+	EXPECT_EQ(client.GetStatus(), "NOERROR");
 }

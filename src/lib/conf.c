@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -17,6 +17,7 @@
  */
 
 #include "conf.h"
+#include <errno.h>
 #include <getopt.h>
 #include <libgen.h>
 #include <linux/limits.h>
@@ -24,7 +25,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <errno.h>
 
 static const char *current_conf_file = NULL;
 static int current_conf_lineno = 0;
@@ -99,6 +99,10 @@ int conf_int(const char *item, void *data, int argc, char *argv[])
 		value = item_int->max;
 	}
 
+	if (item_int->func) {
+		return item_int->func(value, item_int->data);
+	}
+
 	*(item_int->data) = value;
 
 	return 0;
@@ -120,6 +124,10 @@ int conf_int_base(const char *item, void *data, int argc, char *argv[])
 		value = item_int->max;
 	}
 
+	if (item_int->func) {
+		return item_int->func(value, item_int->data);
+	}
+
 	*(item_int->data) = value;
 
 	return 0;
@@ -131,6 +139,10 @@ int conf_string(const char *item, void *data, int argc, char *argv[])
 
 	if (argc < 2) {
 		return -1;
+	}
+
+	if (item_string->func) {
+		return item_string->func(argv[1], item_string->data);
 	}
 
 	strncpy(item_string->data, argv[1], item_string->size);
@@ -156,6 +168,10 @@ int conf_yesno(const char *item, void *data, int argc, char *argv[])
 		yes = 1;
 	} else if (strncmp("no", value, sizeof("no")) == 0 || strncmp("NO", value, sizeof("NO")) == 0) {
 		yes = 0;
+	}
+
+	if (item_yesno->func) {
+		return item_yesno->func(yes, item_yesno->data);
 	}
 
 	*(item_yesno->data) = yes;
@@ -191,6 +207,10 @@ int conf_size(const char *item, void *data, int argc, char *argv[])
 		size = item_size->min;
 	}
 
+	if (item_size->func) {
+		return item_size->func(size, item_size->data);
+	}
+
 	*(item_size->data) = size;
 
 	return 0;
@@ -224,6 +244,10 @@ int conf_ssize(const char *item, void *data, int argc, char *argv[])
 		size = item_size->min;
 	}
 
+	if (item_size->func) {
+		return item_size->func(size, item_size->data);
+	}
+
 	*(item_size->data) = size;
 
 	return 0;
@@ -241,6 +265,9 @@ int conf_enum(const char *item, void *data, int argc, char *argv[])
 
 	for (i = 0; item_enum->list[i].name != NULL; i++) {
 		if (strcmp(enum_name, item_enum->list[i].name) == 0) {
+			if (item_enum->func) {
+				return item_enum->func(item_enum->list[i].id, item_enum->data);
+			}
 			*(item_enum->data) = item_enum->list[i].id;
 			return 0;
 		}
@@ -254,7 +281,7 @@ int conf_enum(const char *item, void *data, int argc, char *argv[])
 	return -1;
 }
 
-static void conf_getopt_reset(void)
+void conf_getopt_reset(void)
 {
 	static struct option long_options[] = {{"-", 0, 0, 0}, {0, 0, 0, 0}};
 	int argc = 2;
@@ -417,7 +444,8 @@ static int load_conf_file(const char *file, struct config_item *items, conf_erro
 
 		line_len = 0;
 		is_last_line_wrap = 0;
-
+		key[0] = '\0';
+		value[0] = '\0';
 		filed_num = sscanf(line, "%63s %8191[^\r\n]s", key, value);
 		if (filed_num <= 0) {
 			continue;
@@ -429,7 +457,7 @@ static int load_conf_file(const char *file, struct config_item *items, conf_erro
 		}
 
 		/* if field format is not key = value, error */
-		if (filed_num != 2) {
+		if (filed_num != 2 && filed_num != 1) {
 			handler(file, line_no, CONF_RET_BADCONF);
 			goto errout;
 		}

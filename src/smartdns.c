@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -23,6 +23,7 @@
 #include "dns_cache.h"
 #include "dns_client.h"
 #include "dns_conf.h"
+#include "dns_plugin.h"
 #include "dns_server.h"
 #include "fast_ping.h"
 #include "hashtable.h"
@@ -64,6 +65,8 @@ typedef enum {
 } smartdns_run_monitor_ret;
 
 static int verbose_screen;
+static int exit_status;
+static int exit_restart;
 
 int capget(struct __user_cap_header_struct *header, struct __user_cap_data_struct *cap);
 int capset(struct __user_cap_header_struct *header, struct __user_cap_data_struct *cap);
@@ -261,7 +264,14 @@ static int _smartdns_prepare_server_flags(struct client_dns_server_flags *flags,
 	} break;
 	case DNS_SERVER_HTTPS: {
 		struct client_dns_server_flag_https *flag_http = &flags->https;
-		flag_http->spi_len = dns_client_spki_decode(server->spki, (unsigned char *)flag_http->spki);
+		if (server->spki[0] != 0) {
+			flag_http->spi_len =
+				dns_client_spki_decode(server->spki, (unsigned char *)flag_http->spki, sizeof(flag_http->spki));
+			if (flag_http->spi_len <= 0) {
+				tlog(TLOG_ERROR, "decode spki failed, %s:%d", server->server, server->port);
+				return -1;
+			}
+		}
 		safe_strncpy(flag_http->hostname, server->hostname, sizeof(flag_http->hostname));
 		safe_strncpy(flag_http->path, server->path, sizeof(flag_http->path));
 		safe_strncpy(flag_http->httphost, server->httphost, sizeof(flag_http->httphost));
@@ -270,7 +280,14 @@ static int _smartdns_prepare_server_flags(struct client_dns_server_flags *flags,
 	} break;
 	case DNS_SERVER_TLS: {
 		struct client_dns_server_flag_tls *flag_tls = &flags->tls;
-		flag_tls->spi_len = dns_client_spki_decode(server->spki, (unsigned char *)flag_tls->spki);
+		if (server->spki[0] != 0) {
+			flag_tls->spi_len =
+				dns_client_spki_decode(server->spki, (unsigned char *)flag_tls->spki, sizeof(flag_tls->spki));
+			if (flag_tls->spi_len <= 0) {
+				tlog(TLOG_ERROR, "decode spki failed, %s:%d", server->server, server->port);
+				return -1;
+			}
+		}
 		safe_strncpy(flag_tls->hostname, server->hostname, sizeof(flag_tls->hostname));
 		safe_strncpy(flag_tls->tls_host_verify, server->tls_host_verify, sizeof(flag_tls->tls_host_verify));
 		flag_tls->skip_check_cert = server->skip_check_cert;
@@ -288,6 +305,7 @@ static int _smartdns_prepare_server_flags(struct client_dns_server_flags *flags,
 	flags->set_mark = server->set_mark;
 	flags->drop_packet_latency_ms = server->drop_packet_latency_ms;
 	safe_strncpy(flags->proxyname, server->proxyname, sizeof(flags->proxyname));
+	safe_strncpy(flags->ifname, server->ifname, sizeof(flags->ifname));
 	if (server->ipv4_ecs.enable) {
 		flags->ipv4_ecs.enable = 1;
 		safe_strncpy(flags->ipv4_ecs.ip, server->ipv4_ecs.ip, sizeof(flags->ipv4_ecs.ip));
@@ -384,18 +402,36 @@ static int _proxy_add_servers(void)
 	return 0;
 }
 
-static int _smartdns_set_ecs_ip(void)
+static int _smartdns_plugin_init(void)
 {
 	int ret = 0;
-	if (dns_conf_ipv4_ecs.enable) {
-		ret |= dns_client_set_ecs(dns_conf_ipv4_ecs.ip, dns_conf_ipv4_ecs.subnet);
+	unsigned long i = 0;
+	struct dns_conf_plugin *plugin = NULL;
+	struct hlist_node *tmp = NULL;
+
+	ret = dns_server_plugin_init();
+	if (ret != 0) {
+		tlog(TLOG_ERROR, "init plugin failed.");
+		goto errout;
 	}
 
-	if (dns_conf_ipv6_ecs.enable) {
-		ret |= dns_client_set_ecs(dns_conf_ipv6_ecs.ip, dns_conf_ipv6_ecs.subnet);
+	hash_for_each_safe(dns_conf_plugin_table.plugins, i, tmp, plugin, node)
+	{
+		ret = dns_plugin_add(plugin->file, plugin->argc, plugin->args, plugin->args_len);
+		if (ret != 0) {
+			goto errout;
+		}
 	}
 
-	return ret;
+	return 0;
+errout:
+	return -1;
+}
+
+static int _smartdns_plugin_exit(void)
+{
+	dns_server_plugin_exit();
+	return 0;
 }
 
 static int _smartdns_create_cert(void)
@@ -466,14 +502,42 @@ static const char *_smartdns_log_path(void)
 	return logfile;
 }
 
-static int _smartdns_init(void)
+static int _smartdns_tlog_output_syslog_callback(struct tlog_loginfo *info, const char *buff, int bufflen,
+												 void *private_data)
 {
-	int ret = 0;
+	int syslog_level = LOG_INFO;
+	switch (info->level) {
+	case TLOG_ERROR:
+		syslog_level = LOG_ERR;
+		break;
+	case TLOG_WARN:
+		syslog_level = LOG_WARNING;
+		break;
+	case TLOG_NOTICE:
+		syslog_level = LOG_NOTICE;
+		break;
+	case TLOG_INFO:
+		syslog_level = LOG_INFO;
+		break;
+	case TLOG_DEBUG:
+		syslog_level = LOG_DEBUG;
+		break;
+	default:
+		syslog_level = LOG_INFO;
+		break;
+	}
+
+	syslog(syslog_level, "%.*s", bufflen, buff);
+	return bufflen;
+}
+
+static int _smartdns_init_log(void)
+{
 	const char *logfile = _smartdns_log_path();
-	int i = 0;
 	char logdir[PATH_MAX] = {0};
 	int logbuffersize = 0;
 	int enable_log_screen = 0;
+	int ret = 0;
 
 	if (get_system_mem_size() > 1024 * 1024 * 1024) {
 		logbuffersize = 1024 * 1024;
@@ -485,8 +549,13 @@ static int _smartdns_init(void)
 	}
 
 	unsigned int tlog_flag = TLOG_NONBLOCK;
-	if (isatty(1) && enable_log_screen == 1) {
+	if (enable_log_screen == 1) {
 		tlog_flag |= TLOG_SCREEN_COLOR;
+	}
+
+	if (dns_conf_log_syslog) {
+		tlog_flag |= TLOG_SEGMENT;
+		tlog_flag |= TLOG_FORMAT_NO_PREFIX;
 	}
 
 	ret = tlog_init(logfile, dns_conf_log_size, dns_conf_log_num, logbuffersize, tlog_flag);
@@ -499,23 +568,25 @@ static int _smartdns_init(void)
 		tlog_setlogscreen(1);
 	}
 
+	if (dns_conf_log_syslog) {
+		tlog_reg_log_output_func(_smartdns_tlog_output_syslog_callback, NULL);
+	}
+
 	tlog_setlevel(dns_conf_log_level);
 	if (dns_conf_log_file_mode > 0) {
 		tlog_set_permission(tlog_get_root(), dns_conf_log_file_mode, dns_conf_log_file_mode);
 	}
 
-	tlog(TLOG_NOTICE, "smartdns starting...(Copyright (C) Nick Peng <pymumu@gmail.com>, build: %s %s)", __DATE__,
-		 __TIME__);
+	return 0;
 
-	if (dns_timer_init() != 0) {
-		tlog(TLOG_ERROR, "init timer failed.");
-		goto errout;
-	}
+errout:
+	return -1;
+}
 
-	if (_smartdns_init_ssl() != 0) {
-		tlog(TLOG_ERROR, "init ssl failed.");
-		goto errout;
-	}
+static int _smartdns_init_load_from_resolv(void)
+{
+	int ret = 0;
+	int i = 0;
 
 	for (i = 0; i < 180 && dns_conf_server_num <= 0; i++) {
 		ret = _smartdns_load_from_resolv();
@@ -536,6 +607,37 @@ static int _smartdns_init(void)
 	}
 
 	if (dns_conf_server_num <= 0) {
+		goto errout;
+	}
+
+	return 0;
+errout:
+	return -1;
+}
+
+static int _smartdns_init(void)
+{
+	int ret = 0;
+
+	if (_smartdns_init_log() != 0) {
+		tlog(TLOG_ERROR, "init log failed.");
+		goto errout;
+	}
+
+	tlog(TLOG_NOTICE, "smartdns starting...(Copyright (C) Nick Peng <pymumu@gmail.com>, build: %s %s)", __DATE__,
+		 __TIME__);
+
+	if (dns_timer_init() != 0) {
+		tlog(TLOG_ERROR, "init timer failed.");
+		goto errout;
+	}
+
+	if (_smartdns_init_ssl() != 0) {
+		tlog(TLOG_ERROR, "init ssl failed.");
+		goto errout;
+	}
+
+	if (_smartdns_init_load_from_resolv() != 0) {
 		tlog(TLOG_ERROR, "no dns server found, exit...");
 		goto errout;
 	}
@@ -575,9 +677,10 @@ static int _smartdns_init(void)
 		goto errout;
 	}
 
-	ret = _smartdns_set_ecs_ip();
+	ret = _smartdns_plugin_init();
 	if (ret != 0) {
-		tlog(TLOG_WARN, "set ecs ip address failed.");
+		tlog(TLOG_ERROR, "init plugin failed.");
+		goto errout;
 	}
 
 	return 0;
@@ -593,6 +696,7 @@ static int _smartdns_run(void)
 
 static void _smartdns_exit(void)
 {
+	_smartdns_plugin_exit();
 	dns_client_exit();
 	proxy_exit();
 	fast_ping_exit();
@@ -614,6 +718,12 @@ static void _sig_error_exit(int signo, siginfo_t *siginfo, void *ct)
 	unsigned long PC = 0;
 	ucontext_t *context = ct;
 	const char *arch = NULL;
+	const char *build_info = "";
+#ifdef SMARTDNS_VERION
+	build_info = SMARTDNS_VERION;
+#else
+	build_info = __DATE__ " " __TIME__;
+#endif
 #if defined(__i386__)
 	int *pgregs = (int *)(&(context->uc_mcontext.gregs));
 	PC = pgregs[REG_EIP];
@@ -633,10 +743,10 @@ static void _sig_error_exit(int signo, siginfo_t *siginfo, void *ct)
 	arch = "mips";
 #endif
 	tlog(TLOG_FATAL,
-		 "process exit with signal %d, code = %d, errno = %d, pid = %d, self = %d, pc = %#lx, addr = %#lx, build(%s "
+		 "process exit with signal %d, code = %d, errno = %d, pid = %d, self = %d, pc = %#lx, addr = %#lx, build("
 		 "%s %s)\n",
 		 signo, siginfo->si_code, siginfo->si_errno, siginfo->si_pid, getpid(), PC, (unsigned long)siginfo->si_addr,
-		 __DATE__, __TIME__, arch);
+		 build_info, arch);
 	print_stack();
 	sleep(1);
 	_exit(SMARTDNS_CRASH_CODE);
@@ -745,61 +855,6 @@ static int _smartdns_init_pre(void)
 	return 0;
 }
 
-static void _smartdns_early_log(struct tlog_loginfo *loginfo, const char *format, va_list ap)
-{
-	char log_buf[TLOG_MAX_LINE_LEN];
-	int sys_log_level = LOG_INFO;
-	int log_buf_maxlen = 0;
-
-	if (loginfo->level < TLOG_WARN) {
-		return;
-	}
-
-	log_buf_maxlen = sizeof(log_buf) - 2;
-	log_buf[log_buf_maxlen] = '\0';
-	int len = vsnprintf(log_buf, log_buf_maxlen, format, ap);
-	if (len <= 0) {
-		return;
-	} else if (len >= log_buf_maxlen) {
-		log_buf[log_buf_maxlen - 2] = '.';
-		log_buf[log_buf_maxlen - 3] = '.';
-		log_buf[log_buf_maxlen - 4] = '.';
-		len = log_buf_maxlen - 1;
-	}
-
-	if (log_buf[len - 1] != '\n') {
-		log_buf[len] = '\n';
-		len++;
-	}
-
-	log_buf[len] = '\0';
-
-	fprintf(stderr, "%s", log_buf);
-
-	switch (loginfo->level) {
-	case TLOG_ERROR:
-		sys_log_level = LOG_ERR;
-		break;
-	case TLOG_WARN:
-		sys_log_level = LOG_WARNING;
-		break;
-	case TLOG_NOTICE:
-		sys_log_level = LOG_NOTICE;
-		break;
-	case TLOG_INFO:
-		sys_log_level = LOG_INFO;
-		break;
-	case TLOG_DEBUG:
-		sys_log_level = LOG_DEBUG;
-		break;
-	default:
-		sys_log_level = LOG_INFO;
-		break;
-	}
-
-	syslog(sys_log_level, "%s", log_buf);
-}
-
 static int _smartdns_child_pid = 0;
 static int _smartdns_child_restart = 0;
 
@@ -906,6 +961,18 @@ static void _smartdns_print_error_tip(void)
 	if (log_path != NULL && access(log_path, F_OK) == 0) {
 		fprintf(stderr, "run daemon failed, please check log at %s\n", log_path);
 	}
+}
+
+void smartdns_exit(int status)
+{
+	dns_server_stop();
+	exit_status = status;
+}
+
+void smartdns_restart(void)
+{
+	dns_server_stop();
+	exit_restart = 1;
 }
 
 #ifdef TEST
@@ -1027,7 +1094,8 @@ int main(int argc, char *argv[])
 
 	srand(time(NULL));
 
-	tlog_reg_early_printf_callback(_smartdns_early_log);
+	tlog_set_early_printf(1, 1, 1);
+	tlog_reg_early_printf_output_callback(_smartdns_tlog_output_syslog_callback, 1, NULL);
 
 	ret = dns_server_load_conf(config_file);
 	if (ret != 0) {
@@ -1096,23 +1164,35 @@ int main(int argc, char *argv[])
 	}
 
 	if (is_run_as_daemon) {
-		ret = daemon_kickoff(0, dns_conf_log_console | verbose_screen);
+		ret = daemon_kickoff(0, dns_conf_log_console | dns_conf_audit_console | verbose_screen);
 		if (ret != 0) {
 			goto errout;
 		}
-	} else if (dns_conf_log_console == 0 && verbose_screen == 0) {
+	} else if (dns_conf_log_console == 0 && dns_conf_audit_console == 0 && verbose_screen == 0) {
 		daemon_close_stdfds();
 	}
 
 	smartdns_test_notify(1);
 	ret = _smartdns_run();
-	tlog(TLOG_INFO, "smartdns exit...");
-	_smartdns_exit();
+	if (ret == 0 && exit_status != 0) {
+		ret = exit_status;
+	}
+
+	if (exit_restart == 0) {
+		tlog(TLOG_INFO, "smartdns exit...");
+		_smartdns_exit();
+	} else {
+		tlog(TLOG_INFO, "smartdns restart...");
+		_smartdns_exit();
+		if (restart_when_crash == 0) {
+			execve(argv[0], argv, environ);
+		}
+	}
 	return ret;
 errout:
 	if (is_run_as_daemon) {
-		daemon_kickoff(ret, dns_conf_log_console | verbose_screen);
-	} else if (dns_conf_log_console == 0 && verbose_screen == 0) {
+		daemon_kickoff(ret, dns_conf_log_console | dns_conf_audit_console | verbose_screen);
+	} else if (dns_conf_log_console == 0 && dns_conf_audit_console == 0 && verbose_screen == 0) {
 		_smartdns_print_error_tip();
 	}
 	smartdns_test_notify(2);

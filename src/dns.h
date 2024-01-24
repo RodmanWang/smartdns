@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -149,12 +149,12 @@ struct dns_head {
 struct dns_packet_dict_item {
 	unsigned short pos;
 	unsigned int hash;
-};
+} __attribute__((packed));
 
 struct dns_packet_dict {
 	short dict_count;
 	struct dns_packet_dict_item names[DNS_PACKET_DICT_SIZE];
-};
+} __attribute__((packed));
 
 /* packet head */
 struct dns_packet {
@@ -179,7 +179,7 @@ struct dns_rrs {
 	unsigned short len;
 	int type;
 	unsigned char data[0];
-};
+} __attribute__((packed));
 
 /* packet encode/decode context */
 struct dns_context {

@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -73,8 +73,7 @@ log-level error
 )""");
 
 	std::vector<std::thread> threads;
-	uint64_t tick = get_tick_count();
-	for (int i = 0; i < 10; i++) {
+	for (int i = 0; i < 5; i++) {
 		auto t = std::thread([&]() {
 			for (int j = 0; j < 10; j++) {
 				smartdns::Client client;
@@ -91,4 +90,6 @@ log-level error
 	for (auto &t : threads) {
 		t.join();
 	}
+
+	EXPECT_LT(qid_map.size(), 80);
 }

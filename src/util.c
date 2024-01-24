@@ -1,6 +1,6 @@
 /*************************************************************************
  *
- * Copyright (C) 2018-2023 Ruilin Peng (Nick) <pymumu@gmail.com>.
+ * Copyright (C) 2018-2024 Ruilin Peng (Nick) <pymumu@gmail.com>.
  *
  * smartdns is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -117,6 +117,7 @@ struct daemon_msg {
 static int ipset_fd;
 static int pidfile_fd;
 static int daemon_fd;
+static int netlink_neighbor_fd;
 
 unsigned long get_tick_count(void)
 {
@@ -213,6 +214,33 @@ int generate_addr_map(const unsigned char *addr_from, const unsigned char *addr_
 
 	for (int i = offset; i < addr_len; i++) {
 		addr_out[i] = addr_from[i];
+	}
+
+	return 0;
+}
+
+int is_private_addr(const unsigned char *addr, int addr_len)
+{
+	if (addr_len == IPV4_ADDR_LEN) {
+		if (addr[0] == 10) {
+			return 1;
+		}
+
+		if (addr[0] == 172 && addr[1] >= 16 && addr[1] <= 31) {
+			return 1;
+		}
+
+		if (addr[0] == 192 && addr[1] == 168) {
+			return 1;
+		}
+	} else if (addr_len == IPV6_ADDR_LEN) {
+		if (addr[0] == 0xFD) {
+			return 1;
+		}
+
+		if (addr[0] == 0xFE && addr[1] == 0x80) {
+			return 1;
+		}
 	}
 
 	return 0;
@@ -420,6 +448,11 @@ int check_is_ipv6(const char *ip)
 	while ((c = *ptr++) != '\0') {
 		if (c == '[' || c == ']') {
 			continue;
+		}
+
+		/* scope id, end of ipv6 address*/
+		if (c == '%') {
+			break;
 		}
 
 		if (c == ':') {
@@ -663,22 +696,13 @@ static int _ipset_socket_init(void)
 		return 0;
 	}
 
-	ipset_fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_NETFILTER);
+	ipset_fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_NETFILTER);
 
 	if (ipset_fd < 0) {
 		return -1;
 	}
 
 	return 0;
-}
-
-static int _ipset_support_timeout(void)
-{
-	if (dns_conf_ipset_timeout_enable) {
-		return 0;
-	}
-
-	return -1;
 }
 
 static int _ipset_operate(const char *ipset_name, const unsigned char addr[], int addr_len, unsigned long timeout,
@@ -746,7 +770,7 @@ static int _ipset_operate(const char *ipset_name, const unsigned char addr[], in
 					addr);
 	nested[1]->len = (void *)buffer + NETLINK_ALIGN(netlink_head->nlmsg_len) - (void *)nested[1];
 
-	if (timeout > 0 && _ipset_support_timeout() == 0) {
+	if (timeout > 0) {
 		expire = htonl(timeout);
 		_ipset_add_attr(netlink_head, IPSET_ATTR_TIMEOUT | NLA_F_NET_BYTEORDER, sizeof(expire), &expire);
 	}
@@ -781,6 +805,109 @@ int ipset_del(const char *ipset_name, const unsigned char addr[], int addr_len)
 	return _ipset_operate(ipset_name, addr, addr_len, 0, IPSET_DEL);
 }
 
+int netlink_get_neighbors(int family,
+						  int (*callback)(const uint8_t *net_addr, int net_addr_len, const uint8_t mac[6], void *arg),
+						  void *arg)
+{
+	if (netlink_neighbor_fd <= 0) {
+		netlink_neighbor_fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, NETLINK_ROUTE);
+		if (netlink_neighbor_fd < 0) {
+			return -1;
+		}
+	}
+
+	struct nlmsghdr *nlh;
+	struct ndmsg *ndm;
+	char buf[1024 * 16];
+	struct iovec iov = {buf, sizeof(buf)};
+	struct sockaddr_nl sa;
+	struct msghdr msg;
+	int len;
+	int ret = 0;
+
+	memset(&msg, 0, sizeof(msg));
+	msg.msg_name = &sa;
+	msg.msg_namelen = sizeof(sa);
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+
+	nlh = (struct nlmsghdr *)buf;
+	nlh->nlmsg_len = NLMSG_LENGTH(sizeof(struct ndmsg));
+	nlh->nlmsg_type = RTM_GETNEIGH;
+	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+	nlh->nlmsg_seq = time(NULL);
+	nlh->nlmsg_pid = getpid();
+
+	ndm = NLMSG_DATA(nlh);
+	ndm->ndm_family = family;
+
+	if (send(netlink_neighbor_fd, buf, NLMSG_SPACE(sizeof(struct ndmsg)), 0) < 0) {
+		return -1;
+	}
+
+	while ((len = recvmsg(netlink_neighbor_fd, &msg, 0)) > 0) {
+		if (ret != 0) {
+			continue;
+		}
+
+		unsigned int rtalen = len;
+		for (nlh = (struct nlmsghdr *)buf; NLMSG_OK(nlh, rtalen); nlh = NLMSG_NEXT(nlh, rtalen)) {
+			ndm = NLMSG_DATA(nlh);
+			struct rtattr *rta = RTM_RTA(ndm);
+			const uint8_t *mac = NULL;
+			const uint8_t *net_addr = NULL;
+			int net_addr_len = 0;
+
+			for (; RTA_OK(rta, rtalen); rta = RTA_NEXT(rta, rtalen)) {
+				if (rta->rta_type == NDA_DST) {
+					if (ndm->ndm_family == AF_INET) {
+						struct in_addr *addr = RTA_DATA(rta);
+						if (IN_MULTICAST(ntohl(addr->s_addr))) {
+							continue;
+						}
+
+						if (ntohl(addr->s_addr) == 0) {
+							continue;
+						}
+
+						net_addr = (uint8_t *)&addr->s_addr;
+						net_addr_len = IPV4_ADDR_LEN;
+					} else if (ndm->ndm_family == AF_INET6) {
+						struct in6_addr *addr = RTA_DATA(rta);
+						if (IN6_IS_ADDR_MC_NODELOCAL(addr)) {
+							continue;
+						}
+						if (IN6_IS_ADDR_MC_LINKLOCAL(addr)) {
+							continue;
+						}
+						if (IN6_IS_ADDR_MC_SITELOCAL(addr)) {
+							continue;
+						}
+
+						if (IN6_IS_ADDR_UNSPECIFIED(addr)) {
+							continue;
+						}
+
+						net_addr = addr->s6_addr;
+						net_addr_len = IPV6_ADDR_LEN;
+					}
+				} else if (rta->rta_type == NDA_LLADDR) {
+					mac = RTA_DATA(rta);
+				}
+			}
+
+			if (net_addr != NULL && mac != NULL) {
+				ret = callback(net_addr, net_addr_len, mac, arg);
+				if (ret != 0) {
+					break;
+				}
+			}
+		}
+	}
+
+	return ret;
+}
+
 unsigned char *SSL_SHA256(const unsigned char *d, size_t n, unsigned char *md)
 {
 	static unsigned char m[SHA256_DIGEST_LENGTH];
@@ -803,10 +930,14 @@ unsigned char *SSL_SHA256(const unsigned char *d, size_t n, unsigned char *md)
 	return (md);
 }
 
-int SSL_base64_decode(const char *in, unsigned char *out)
+int SSL_base64_decode(const char *in, unsigned char *out, int max_outlen)
 {
 	size_t inlen = strlen(in);
 	int outlen = 0;
+
+	if (max_outlen < (int)inlen / 4 * 3) {
+		goto errout;
+	}
 
 	if (inlen == 0) {
 		return 0;
@@ -1796,7 +1927,30 @@ errout:
 	return DAEMON_RET_ERR;
 }
 
-#ifdef DEBUG
+int parser_mac_address(const char *in_mac, uint8_t mac[6])
+{
+	int fileld_num = 0;
+
+	if (in_mac == NULL) {
+		return -1;
+	}
+
+	fileld_num =
+		sscanf(in_mac, "%2hhx:%2hhx:%2hhx:%2hhx:%2hhx:%2hhx", &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]);
+	if (fileld_num == 6) {
+		return 0;
+	}
+
+	fileld_num =
+		sscanf(in_mac, "%2hhx-%2hhx-%2hhx-%2hhx-%2hhx-%2hhx", &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]);
+	if (fileld_num == 6) {
+		return 0;
+	}
+
+	return -1;
+}
+
+#if defined(DEBUG) || defined(TEST)
 struct _dns_read_packet_info {
 	int data_len;
 	int message_len;
@@ -1890,8 +2044,9 @@ static int _dns_debug_display(struct dns_packet *packet)
 	struct dns_rrs *rrs = NULL;
 	int rr_count = 0;
 	char req_host[MAX_IP_LEN];
+	int ret;
 
-	for (j = 1; j < DNS_RRS_END; j++) {
+	for (j = 1; j < DNS_RRS_OPT; j++) {
 		rrs = dns_get_rrs_start(packet, j, &rr_count);
 		printf("section: %d\n", j);
 		for (i = 0; i < rr_count && rrs; i++, rrs = dns_get_rrs_next(packet, rrs)) {
@@ -1917,12 +2072,12 @@ static int _dns_debug_display(struct dns_packet *packet)
 				unsigned short priority = 0;
 				unsigned short weight = 0;
 				unsigned short port = 0;
-				int ret = 0;
 
 				char name[DNS_MAX_CNAME_LEN] = {0};
 				char target[DNS_MAX_CNAME_LEN];
 
-				ret = dns_get_SRV(rrs, name, DNS_MAX_CNAME_LEN, &ttl, &priority, &weight, &port, target, DNS_MAX_CNAME_LEN);
+				ret = dns_get_SRV(rrs, name, DNS_MAX_CNAME_LEN, &ttl, &priority, &weight, &port, target,
+								  DNS_MAX_CNAME_LEN);
 				if (ret < 0) {
 					tlog(TLOG_DEBUG, "decode SRV failed, %s", name);
 					return -1;
@@ -1936,7 +2091,6 @@ static int _dns_debug_display(struct dns_packet *packet)
 				char target[DNS_MAX_CNAME_LEN] = {0};
 				struct dns_https_param *p = NULL;
 				int priority = 0;
-				int ret = 0;
 
 				ret = dns_get_HTTPS_svcparm_start(rrs, &p, name, DNS_MAX_CNAME_LEN, &ttl, &priority, target,
 												  DNS_MAX_CNAME_LEN);
@@ -2013,10 +2167,6 @@ static int _dns_debug_display(struct dns_packet *packet)
 			case DNS_T_CNAME: {
 				char cname[DNS_MAX_CNAME_LEN];
 				char name[DNS_MAX_CNAME_LEN] = {0};
-				if (dns_conf_force_no_cname) {
-					continue;
-				}
-
 				dns_get_CNAME(rrs, name, DNS_MAX_CNAME_LEN, &ttl, cname, DNS_MAX_CNAME_LEN);
 				printf("domain: %s TTL: %d CNAME: %s\n", name, ttl, cname);
 			} break;
@@ -2033,6 +2183,48 @@ static int _dns_debug_display(struct dns_packet *packet)
 			}
 		}
 		printf("\n");
+	}
+
+	rr_count = 0;
+	rrs = dns_get_rrs_start(packet, DNS_RRS_OPT, &rr_count);
+	if (rr_count <= 0) {
+		return 0;
+	}
+
+	printf("section opt:\n");
+	for (i = 0; i < rr_count && rrs; i++, rrs = dns_get_rrs_next(packet, rrs)) {
+		switch (rrs->type) {
+		case DNS_OPT_T_TCP_KEEPALIVE: {
+			unsigned short idle_timeout = 0;
+			ret = dns_get_OPT_TCP_KEEPALIVE(rrs, &idle_timeout);
+			if (idle_timeout == 0) {
+				continue;
+			}
+
+			printf("tcp keepalive: %d\n", idle_timeout);
+		} break;
+		case DNS_OPT_T_ECS: {
+			struct dns_opt_ecs ecs;
+			memset(&ecs, 0, sizeof(ecs));
+			ret = dns_get_OPT_ECS(rrs, &ecs);
+			if (ret != 0) {
+				continue;
+			}
+			printf("ecs family: %d, src_prefix: %d, scope_prefix: %d, ", ecs.family, ecs.source_prefix,
+				   ecs.scope_prefix);
+			if (ecs.family == 1) {
+				char ip[16] = {0};
+				inet_ntop(AF_INET, ecs.addr, ip, sizeof(ip));
+				printf("ecs address: %s\n", ip);
+			} else if (ecs.family == 2) {
+				char ip[64] = {0};
+				inet_ntop(AF_INET6, ecs.addr, ip, sizeof(ip));
+				printf("ecs address: %s\n", ip);
+			}
+		} break;
+		default:
+			break;
+		}
 	}
 
 	return 0;
